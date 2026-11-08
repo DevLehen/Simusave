@@ -1,0 +1,272 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Rubble Oracle – Survivor Likelihood Simulator</title>
+<style>
+:root{--bg:#f2f4f7;--fg:#14181f;--panel:rgba(255,255,255,.9);--line:#c5ccd6;--acc:#d9480f;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0d1117;--fg:#e6edf3;--panel:rgba(22,27,34,.9);--line:#30363d;--acc:#ff7b3a}}
+:root[data-theme="dark"]{--bg:#0d1117;--fg:#e6edf3;--panel:rgba(22,27,34,.9);--line:#30363d;--acc:#ff7b3a}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:13px system-ui,sans-serif;overflow:hidden}
+#wrap{position:relative;width:100%;height:100%}
+canvas{display:block;touch-action:none}
+#panel{position:absolute;top:8px;left:8px;width:280px;max-width:calc(100% - 16px);max-height:calc(100% - 16px);overflow:auto;box-sizing:border-box;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px}
+h1{font-size:15px;margin:0 0 6px}
+label{display:block;margin-top:6px}label b{float:right;font-weight:600}
+input[type=range]{width:100%;margin:2px 0}
+select,button{width:100%;margin-top:6px;padding:6px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+button.go{background:var(--acc);color:#fff;border:0;font-weight:600}
+button:disabled{opacity:.5}
+#stats{margin-top:8px;padding-top:6px;border-top:1px solid var(--line);line-height:1.5}
+#leg{height:10px;border-radius:5px;margin-top:4px;background:linear-gradient(90deg,hsl(240,100%,50%),hsl(120,100%,50%),hsl(60,100%,50%),hsl(0,100%,50%))}
+.sm{font-size:11px;opacity:.75}
+</style></head><body>
+<div id="wrap"><div id="panel">
+<h1>Rubble Oracle</h1>
+<div class="sm">Fly: drag to look · WASD move · Q/E down/up · Shift fast</div>
+<label>Hazard type<select id="haz"><option value="quake">Earthquake (fault line + soil)</option><option value="tornado">Tornado (narrow path)</option><option value="flood">Tsunami / surge (coastal wave)</option></select></label>
+<div id="sl"></div>
+<label><input type="checkbox" id="heat" checked> Show survivor-probability overlay</label>
+<button class="go" id="run">▶ Run simulation</button>
+<button disabled>Auto-fill from disaster photo (planned)</button>
+<div id="stats"></div>
+<div class="sm" style="margin-top:6px">Overlay: relative likelihood of finding live survivors</div><div id="leg"></div>
+<div class="sm" style="margin-top:6px">Prototype model: fragility and survival-decay values are placeholders to be calibrated against real disaster data.</div>
+</div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const SZ=800,N=16,PT=50,G=48,CELL=SZ/G;
+const rng=s=>()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+const erf=x=>{const s=Math.sign(x);x=Math.abs(x);const t=1/(1+.3275911*x);const p=((((1.061405429*t-1.453152027)*t+1.421413741)*t-.284496736)*t+.254829592)*t;return s*(1-p*Math.exp(-x*x))};
+const Phi=z=>.5*(1+erf(z/Math.SQRT2));
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const SURV=[[0,1],[1,.91],[24,.37],[48,.19],[72,.07],[96,.03]];
+function surv(t){for(let i=1;i<SURV.length;i++){if(t<=SURV[i][0]){const[a,b]=[SURV[i-1],SURV[i]];return a[1]+(b[1]-a[1])*(t-a[0])/(b[0]-a[0])}}return SURV[SURV.length-1][1]}
+
+// ---------- UI ----------
+const SP=[['int','Intensity (1–10)',1,10,.1,7],['spr','Spread / reach (m)',20,600,10,250],['soil','Soil amplification (quake)',0,1.5,.05,.8],['dir','Direction (° from north)',0,360,1,45],['ex','Epicenter X (m)',0,800,5,400],['ez','Epicenter Z (m)',0,800,5,400],['vul','Building vulnerability ×',.5,1.5,.05,1],['pan','Collapse style (0 topple → 1 pancake)',0,1,.05,.6],['tod','Time of day (h)',0,24,.25,3],['hrs','Hours since event',0,96,.5,6],['den','Population density ×',.3,2,.05,1]];
+const sl=document.getElementById('sl');
+SP.forEach(([id,l,mn,mx,st,v])=>{const d=document.createElement('label');d.innerHTML=`${l}<b id="v_${id}">${v}</b><input type="range" id="${id}" min="${mn}" max="${mx}" step="${st}" value="${v}">`;sl.appendChild(d);d.querySelector('input').oninput=e=>{document.getElementById('v_'+id).textContent=e.target.value;compute()}});
+const P=id=>+document.getElementById(id).value;
+const hz=document.getElementById('haz');hz.onchange=()=>compute();
+
+// ---------- Scene ----------
+const wrap=document.getElementById('wrap');
+const renderer=new THREE.WebGLRenderer({antialias:true});wrap.insertBefore(renderer.domElement,wrap.firstChild);
+renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.15;
+const scene=new THREE.Scene();const sk=document.createElement('canvas');sk.width=4;sk.height=256;{const c=sk.getContext('2d'),g=c.createLinearGradient(0,0,0,256);g.addColorStop(0,'#3f6fb5');g.addColorStop(.55,'#9cc0e6');g.addColorStop(1,'#e6e9ea');c.fillStyle=g;c.fillRect(0,0,4,256)}
+scene.background=new THREE.CanvasTexture(sk);scene.fog=new THREE.Fog(0xd5dde4,600,2800);
+const camera=new THREE.PerspectiveCamera(60,1,1,4000);camera.rotation.order='YXZ';
+camera.position.set(400,300,-260);let yaw=Math.PI,pitch=-.42;
+scene.add(new THREE.HemisphereLight(0xcfe3ff,0x6b6a58,.75));
+const sun=new THREE.DirectionalLight(0xfff0dc,1.5);sun.position.set(850,650,650);sun.target.position.set(400,0,400);scene.add(sun,sun.target);
+sun.castShadow=true;sun.shadow.mapSize.set(4096,4096);Object.assign(sun.shadow.camera,{left:-700,right:700,top:700,bottom:-700,near:10,far:2500});sun.shadow.bias=-.0004;
+const ground=new THREE.Mesh(new THREE.PlaneGeometry(3000,3000),new THREE.MeshLambertMaterial({color:0x5d6b58}));ground.rotation.x=-Math.PI/2;ground.position.set(400,0,400);ground.receiveShadow=true;scene.add(ground);
+const gc=document.createElement('canvas');gc.width=gc.height=2048;{const c=gc.getContext('2d'),k=2048/SZ;
+ c.fillStyle='#6f736b';c.fillRect(0,0,2048,2048);
+ for(let i=0;i<=N;i++){const p=i*PT*k;c.fillStyle='#9a9a95';c.fillRect(p-11*k,0,22*k,2048);c.fillRect(0,p-11*k,2048,22*k)}
+ for(let i=0;i<=N;i++){const p=i*PT*k;c.fillStyle='#2c2e33';c.fillRect(p-8*k,0,16*k,2048);c.fillRect(0,p-8*k,2048,16*k)}
+ c.fillStyle='#d9c35a';for(let i=0;i<=N;i++){const p=i*PT*k;for(let t=0;t<2048;t+=14*k){c.fillRect(p-.5,t,1,7*k);c.fillRect(t,p-.5,7*k,1)}}
+ for(let n=0;n<60000;n++){c.fillStyle=Math.random()<.5?'rgba(0,0,0,.07)':'rgba(255,255,255,.05)';c.fillRect(Math.random()*2048,Math.random()*2048,2,2)}}
+const gt=new THREE.CanvasTexture(gc);gt.anisotropy=8;
+const cityGround=new THREE.Mesh(new THREE.PlaneGeometry(SZ,SZ),new THREE.MeshLambertMaterial({map:gt}));cityGround.rotation.x=-Math.PI/2;cityGround.position.set(400,.05,400);cityGround.receiveShadow=true;scene.add(cityGround);
+const marker=new THREE.Mesh(new THREE.CylinderGeometry(3,3,500,12),new THREE.MeshBasicMaterial({color:0xff2222,transparent:true,opacity:.45}));scene.add(marker);
+
+// ---------- City ----------
+const rnd=rng(20260);const B=[];
+const COL={res:0x7f93b0,off:0xb8c4d6,ret:0xc9a77a},RUB=new THREE.Color(0x6b5d52);
+for(let i=0;i<N;i++)for(let j=0;j<N;j++){
+ const x=PT*(i+.5),z=PT*(j+.5),dc=Math.hypot(x-400,z-400),r=rnd();
+ let fl,type;
+ if(dc<200){fl=8+Math.floor(rnd()*23);type=r<.6?'off':r<.9?'ret':'res'}
+ else if(dc<400){fl=3+Math.floor(rnd()*10);type=r<.6?'res':r<.8?'off':'ret'}
+ else{fl=2+Math.floor(rnd()*4);type=r<.85?'res':'ret'}
+ const h=fl*3.5,v=.2+rnd()*.8,r2=rnd();
+ const cls=fl<=5&&type!=='off'?(v>.65?'urm':r2<.35?'soft':'rc'):(fl>=12?'steel':r2<.5?'rc':'steel');
+ B.push({x,z,fl,h,type,v,cls,f0:cls==='soft'?0:Math.floor(rnd()*Math.max(1,fl*.5)),u:rnd(),w:rnd(),az:rnd(),m2:rnd(),spd:.8+rnd()*.5,cutf:.4+rnd()*.4,base:new THREE.Color(COL[type]).multiplyScalar(.85+rnd()*.3),
+  fr:Array.from({length:fl},()=>({jx:rnd()-.5,jz:rnd()-.5,jr:rnd()-.5,a:rnd(),c:.9+rnd()*.2})),state:0,mod:false,topple:false,arr:0,pc:0,pp:0});
+}
+
+// facade texture: window bays with glass highlights (instance colors tint the walls)
+const wc=document.createElement('canvas');wc.width=256;wc.height=64;{const c=wc.getContext('2d');c.fillStyle='#e8e6e1';c.fillRect(0,0,256,64);
+ for(let i=0;i<8;i++){const x=i*32+5,q=.55+Math.random()*.4;c.fillStyle=`rgb(${40*q|0},${58*q|0},${80*q|0})`;c.fillRect(x,14,22,34);c.fillStyle='rgba(255,255,255,.2)';c.fillRect(x,14,22,7);c.fillStyle='rgba(0,0,0,.25)';c.fillRect(x,46,22,2)}
+ c.fillStyle='#bdbab3';c.fillRect(0,0,256,6);c.fillRect(0,58,256,6)}
+const wt=new THREE.CanvasTexture(wc);wt.anisotropy=8;
+const wallM=new THREE.MeshStandardMaterial({map:wt,roughness:.55,metalness:.15}),roofM=new THREE.MeshStandardMaterial({color:0xcfcfca,roughness:.95});
+// floor slabs (one instance per floor) so buildings can fail floor by floor
+const MED={urm:[2,3,4,5],soft:[2.5,3.5,4.5,5.5],rc:[3.5,5,6.5,8],steel:[4,5.5,7,8.5]}; // placeholder damage-state medians
+const NF=B.reduce((a,b)=>a+b.fl,0),FM=new THREE.InstancedMesh(new THREE.BoxGeometry(32,3.4,32),[wallM,wallM,roofM,roofM,wallM,wallM],NF);
+FM.instanceMatrix.setUsage(THREE.DynamicDrawUsage);FM.frustumCulled=false;FM.castShadow=FM.receiveShadow=true;scene.add(FM);
+{let k=0;const c0=new THREE.Color();B.forEach(b=>{b.fi=k;for(let i=0;i<b.fl;i++)FM.setColorAt(k++,c0.copy(b.base).multiplyScalar(b.fr[i].c))})}
+FM.instanceColor.needsUpdate=true;
+const GM=new THREE.Matrix4(),MM=new THREE.Matrix4(),tm=new THREE.Matrix4(),tn=new THREE.Matrix4(),qq=new THREE.Quaternion(),cc=new THREE.Color(),AMB=new THREE.Color(0xe0b04a);
+
+// ---------- Heat overlay ----------
+const hc=document.createElement('canvas');hc.width=hc.height=G;const hx=hc.getContext('2d');
+const htex=new THREE.CanvasTexture(hc);
+const heatMesh=new THREE.Mesh(new THREE.PlaneGeometry(SZ,SZ),new THREE.MeshBasicMaterial({map:htex,transparent:true,opacity:.85,depthWrite:false,toneMapped:false}));
+heatMesh.rotation.x=-Math.PI/2;heatMesh.position.set(400,.4,400);scene.add(heatMesh);
+const soilAt=(x,z)=>clamp(.5+.28*Math.sin(x/110+1)+.22*Math.sin(z/85+2)*Math.cos(x/170),0,1);
+const scv=document.createElement('canvas');scv.width=scv.height=G;const scx=scv.getContext('2d');
+for(let y=0;y<G;y++)for(let x=0;x<G;x++){scx.fillStyle=`rgba(190,120,40,${soilAt((x+.5)*CELL,(y+.5)*CELL)*.6})`;scx.fillRect(x,y,1,1)}
+const soilMesh=new THREE.Mesh(new THREE.PlaneGeometry(SZ,SZ),new THREE.MeshBasicMaterial({map:new THREE.CanvasTexture(scv),transparent:true,depthWrite:false}));
+soilMesh.rotation.x=-Math.PI/2;soilMesh.position.set(400,.25,400);scene.add(soilMesh);
+const fault=new THREE.Mesh(new THREE.BoxGeometry(3,3,1000),new THREE.MeshBasicMaterial({color:0xff2222}));scene.add(fault);
+
+// ---------- Model ----------
+let dirx=0,dirz=1,T=1,running=false;
+function compute(){
+ const h=hz.value,S=P('int'),sp=P('spr'),a=P('dir')*Math.PI/180,ex=P('ex'),ez=P('ez'),V=P('vul'),pan=P('pan'),tod=P('tod'),hrs=P('hrs'),den=P('den');
+ dirx=Math.sin(a);dirz=Math.cos(a);
+ const sv=surv(hrs);let heat=new Float32Array(G*G),occT=0,trT=0,alT=0,col=0;
+ const axis=new THREE.Vector3();
+ B.forEach(b=>{
+  const rx=b.x-ex,rz=b.z-ez,s=rx*dirx+rz*dirz,perp=rx*dirz-rz*dirx;let I,arr;
+  if(h==='quake'){const L=sp*1.5,de=Math.hypot(perp,Math.max(0,Math.abs(s)-L));
+   I=S*(.35+.65*Math.exp(-Math.pow(de/sp,1.2)))*(1+.25*Math.tanh(s/sp))*(1+.5*P('soil')*soilAt(b.x,b.z));arr=Math.hypot(rx,rz)/900}
+  else if(h==='tornado'){I=(3+S*.7)*Math.exp(-Math.pow(perp/(sp*.4),2));arr=(s+600)/1200}
+  else{const c=(b.x-400)*dirx+(b.z-400)*dirz+566;I=(1+S*.9)*Math.exp(-Math.max(0,c)/(sp*3))/(1+b.h/40);arr=c/1132}
+  // damage states (slight, moderate, extensive, complete) by construction class, age, height
+  const ag=(1.2-.5*b.v)/V*(1-.006*b.fl),ds=MED[b.cls].map(m=>I>1e-3?Phi(Math.log(I/(m*ag))/.4):0);
+  const pc=ds[3],pp=Math.max(pc,ds[2]);
+  b.pc=pc;b.pp=pp;b.state=b.u<pc?2:b.u<pp?1:0;b.mod=b.state===0&&b.u<ds[1];
+  b.arr=clamp(arr,0,1)*.5;
+  // fall direction: random for quakes, wind/surge-aligned (with scatter) otherwise
+  const az=h==='quake'?b.az*6.2832:a+(b.az-.5)*.8;b.fx=Math.sin(az);b.fz=Math.cos(az);
+  { // how far can this building fall before it hits a neighbour? (max tilt angle and free distance)
+   let reach=1e9,mx=1.45;const pd=16*(Math.abs(b.fx)+Math.abs(b.fz));
+   for(const o of B){if(o===b)continue;const ox=o.x-b.x,oz=o.z-b.z,al=ox*b.fx+oz*b.fz;if(al<=pd||Math.abs(ox*b.fz-oz*b.fx)>30)continue;
+    const d=al-2*pd;if(d<1||d>b.h+10)continue;
+    const th=Math.hypot(d,o.h)<=b.h?Math.atan(d/o.h):d<=b.h?Math.asin(d/b.h):9;
+    if(th<mx)mx=th;if(d<reach)reach=d}
+   b.mx=Math.max(.12,mx);b.reach=Math.max(8,reach)}
+  b.mode=b.state===2?(b.fl>=3&&b.w>pan?'topple':b.cls==='soft'?'lean':b.m2<.45?'pancake':b.m2<.75?'slide':'crumble'):b.state===1?'upper':'';
+  b.topple=b.mode==='topple';
+  if(b.state===2)col++;
+  // occupancy by type and time of day
+  let pres,per;
+  if(b.type==='res'){per=5;pres=(tod>=22||tod<7)?.95:(tod>=7&&tod<9)||(tod>=17&&tod<22)?.6:.35}
+  else if(b.type==='off'){per=12;pres=(tod>=8&&tod<18)?.9:.04}
+  else{per=8;pres=(tod>=10&&tod<21)?.7:.03}
+  const occ=b.fl*per*pres*den;
+  const trapped=occ*(pc*.85+(pp-pc)*.2);
+  const alive=occ*(pc*.85*(.78-.3*pan)+(pp-pc)*.2*.95)*sv;
+  occT+=occ;trT+=trapped;alT+=alive;b.alive=alive;
+  // debris footprint: toppled structures spread survivors along the fall direction
+  const tp=b.fl>=3?(1-pan):0;
+  for(const k of[0,.5,1]){const px=b.x+b.fx*Math.min(b.h*.55,b.reach)*tp*k,pz=b.z+b.fz*Math.min(b.h*.55,b.reach)*tp*k;
+   heat[clamp(Math.floor(pz/CELL),0,G-1)*G+clamp(Math.floor(px/CELL),0,G-1)]+=alive/3}
+
+ });
+ // light blur then draw
+ const bl=new Float32Array(G*G);let mx=0;
+ for(let y=0;y<G;y++)for(let x=0;x<G;x++){let s=0,n=0;for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){const X=x+dx,Y=y+dy;if(X>=0&&Y>=0&&X<G&&Y<G){const w=(dx||dy)?.5:1;s+=heat[Y*G+X]*w;n+=w}}bl[y*G+x]=s/n;mx=Math.max(mx,s/n)}
+ hx.clearRect(0,0,G,G);
+ for(let y=0;y<G;y++)for(let x=0;x<G;x++){const v=mx>0?bl[y*G+x]/mx:0;if(v<.03)continue;hx.fillStyle=`hsla(${240-240*v},100%,50%,${.25+.6*v})`;hx.fillRect(x,y,1,1)}
+ htex.needsUpdate=true;
+ marker.visible=h==='tornado';marker.position.set(ex,250,ez);fault.visible=h==='quake';fault.position.set(ex,1.5,ez);fault.rotation.y=a;fault.scale.z=3*sp/1000;soilMesh.visible=h==='quake'&&P('soil')>0;soilMesh.material.opacity=clamp(P('soil'),0,1);
+ const top=[...bl.keys()].sort((p,q)=>bl[q]-bl[p]).slice(0,4).filter(i=>bl[i]>0);
+ document.getElementById('stats').innerHTML=
+  `Occupants (est.): <b>${Math.round(occT)}</b><br>Expected trapped: <b>${Math.round(trT)}</b><br>Expected alive at ${hrs} h: <b>${Math.round(alT)}</b><br>Likely collapsed buildings: <b>${col}</b> / ${B.length}<br><span class="sm">Top search zones (x, z in m):</span><br>`+
+  top.map((i,n)=>`${n+1}. (${Math.round((i%G+.5)*CELL)}, ${Math.round((Math.floor(i/G)+.5)*CELL)}) ≈ ${bl[i].toFixed(1)} survivors/cell`).join('<br>');
+}
+compute();
+
+// ---------- Per-frame building animation ----------
+const ax=new THREE.Vector3(),idq=new THREE.Quaternion();
+// debris pool (instanced chunks) and dust sprites
+const NP=16,GRAV=35,ZERO=new THREE.Matrix4().makeScale(0,0,0),dum=new THREE.Object3D();
+const dM=new THREE.InstancedMesh(new THREE.BoxGeometry(1,1,1),new THREE.MeshLambertMaterial({color:0xffffff}),B.length*NP);
+dM.instanceMatrix.setUsage(THREE.DynamicDrawUsage);dM.frustumCulled=false;dM.castShadow=true;scene.add(dM);
+const dcv=document.createElement('canvas');dcv.width=dcv.height=64;
+{const c=dcv.getContext('2d'),gr=c.createRadialGradient(32,32,2,32,32,32);gr.addColorStop(0,'rgba(190,180,165,.9)');gr.addColorStop(1,'rgba(190,180,165,0)');c.fillStyle=gr;c.fillRect(0,0,64,64)}
+const dtex=new THREE.CanvasTexture(dcv);
+B.forEach((b,i)=>{b.i=i;b.dust=new THREE.Sprite(new THREE.SpriteMaterial({map:dtex,transparent:true,depthWrite:false,opacity:0}));b.dust.visible=false;scene.add(b.dust);
+ b.pt=[];const c=b.base.clone().lerp(RUB,.5);
+ for(let k=0;k<NP;k++){b.pt.push({fx:rnd()-.5,fy:rnd(),fz:rnd()-.5,vx:rnd()-.5,vz:rnd()-.5,vy:rnd(),s:1.5+rnd()*3.5,r:rnd()*6});dM.setColorAt(i*NP+k,c.clone().multiplyScalar(.7+rnd()*.5))}});
+dM.instanceColor.needsUpdate=true;
+
+function animateBuildings(){
+ ax.set(dirz,0,-dirx);
+ B.forEach(b=>{
+  const ts=(T-b.arr)*7*b.spd,st=b.state,fl=b.fl,mode=b.mode,rot=mode==='topple'||mode==='lean';
+  const sh=st&&ts>-1&&ts<3?.9*Math.sin(ts*30+b.i)*(st===2?1:.5):0;
+  const hitT=.3+1.7*Math.min(1,Math.sqrt(b.mx/1.45));
+  GM.identity();
+  if(rot){ // rigid swing about the footprint edge on the fall side; stops when it meets a neighbour
+   const pd=16*(Math.abs(b.fx)+Math.abs(b.fz)),px=b.x+b.fx*pd,pz=b.z+b.fz*pd;
+   const ang=mode==='topple'?Math.min(1.45*Math.pow(clamp((ts-.3)/1.7,0,1),2),b.mx):Math.min(.35*clamp((ts-.2)/1,0,1),b.mx*.9);
+   ax.set(b.fz,0,-b.fx);qq.setFromAxisAngle(ax,ang);GM.makeRotationFromQuaternion(qq);tm.makeTranslation(px,0,pz);tn.makeTranslation(-px,0,-pz);GM.premultiply(tm).multiply(tn)}
+  for(let i=0;i<fl;i++){
+   const r=b.fr[i];let x=b.x,y=i*3.5+1.7,z=b.z,sx=1,sy=1,tx=0,tz=0,col=0;
+   if(mode==='pancake'||mode==='slide'||mode==='crumble'){
+    // pancake: failure starts at floor f0 and travels outward; slide: floors shear off sideways; crumble: top-down, base survives
+    const kb=mode==='crumble'?Math.floor(fl*.15):0,delay=mode==='crumble'?(fl-1-i)*.05:Math.abs(i-b.f0)*.05;
+    const e=i<kb?0:clamp((ts-.2-delay)/.6,0,1),rest=kb*3.5+(i-kb)*.55+.3;
+    y+=(rest-y)*e*e;sx=1+.3*e*(.5+r.a);x+=r.jx*3*e;z+=r.jz*3*e;tx=r.jr*.35*e;tz=-r.jr*.3*e;sy=1-.84*e;col=e;
+    if(mode==='slide'){const sl=e*(i/fl)*20;x+=b.fx*sl;z+=b.fz*sl}
+   }else if(mode==='lean'){
+    // soft-story: ground floor crushes, the tower sinks and leans
+    const e=clamp((ts-.2)/.8,0,1);if(i===0){y=1.7*(1-.75*e);sy=1-.75*e}else y-=2.55*e;col=e*.4;
+   }else if(st===1){
+    // partial collapse: upper floors fail onto the lower ones (extent varies per building)
+    const cut=Math.max(1,Math.floor(fl*b.cutf));
+    if(i>=cut){const e=clamp((ts-.2-(i-cut)*.05)/.6,0,1),rest=cut*3.5+(i-cut)*.6;y+=(rest-y)*e*e;x+=r.jx*4*e;z+=r.jz*4*e;tx=r.jr*.3*e;sy=1-.8*e;col=e}
+   }
+   if(mode==='topple'){const br=clamp((ts-hitT)/.5,0,1);x+=r.jx*5*br;z+=r.jz*5*br;sy=1-.5*br;col=clamp(ts-.3,0,1)*.5+br*.4}
+   y+=(Math.abs(tx)+Math.abs(tz))*16*sx; // lift tilted slabs so their corners never sink below ground
+   if(sh){x+=sh*.5;z+=sh*.3}
+   dum.position.set(x,y,z);dum.rotation.set(tx,0,tz);dum.scale.set(sx,sy,sx);dum.updateMatrix();
+   MM.multiplyMatrices(GM,dum.matrix);FM.setMatrixAt(b.fi+i,MM);
+   cc.copy(b.base).multiplyScalar(r.c).lerp(RUB,col*.75);if(b.mod&&!col)cc.lerp(AMB,.3);FM.setColorAt(b.fi+i,cc);
+  }
+  // falling debris chunks (stateless function of time, so sliders and replay stay consistent)
+  const n=st===2?NP:st===1?4:0;
+  for(let k=0;k<NP;k++){
+   const idx=b.i*NP+k;
+   if(k>=n||ts<0){dM.setMatrixAt(idx,ZERO);continue}
+   const q=b.pt[k],t=ts-(1-q.fy)*.6;
+   if(t<0){dM.setMatrixAt(idx,ZERO);continue}
+   const sp=1-Math.exp(-t*1.2),tl=b.topple&&st===2?1-Math.exp(-t):0,amp=st===2?22:8,tf=Math.min(t,1.5);
+   const y=Math.max(q.s/2,q.fy*b.h*.8+q.vy*6*t-.5*GRAV*t*t);
+   dum.position.set(b.x+q.fx*30+q.vx*amp*sp+b.fx*Math.min(b.h*.3,b.reach)*tl,y,b.z+q.fz*30+q.vz*amp*sp+b.fz*Math.min(b.h*.3,b.reach)*tl);
+   dum.rotation.set(q.r*tf,q.r*1.7*tf,0);dum.scale.setScalar(q.s);dum.updateMatrix();dM.setMatrixAt(idx,dum.matrix);
+  }
+  // dust cloud
+  const dv=b.dust;
+  if(st===2&&ts>0){
+   const u=clamp(ts/3,0,1),o=b.topple?1:0;dv.visible=true;
+   dv.position.set(b.x+b.fx*Math.min(b.h*.2,b.reach)*o,6+b.h*.2*u,b.z+b.fz*Math.min(b.h*.2,b.reach)*o);
+   dv.scale.setScalar(30+(b.h*.9+40)*Math.sqrt(u));
+   dv.material.opacity=.6*Math.min(1,ts*2)*(1-.75*clamp((ts-2)/5,0,1));
+  }else dv.visible=false;
+ });
+ dM.instanceMatrix.needsUpdate=true;FM.instanceMatrix.needsUpdate=true;FM.instanceColor.needsUpdate=true;
+}
+
+// ---------- Controls ----------
+const keys={};
+addEventListener('keydown',e=>{if(/INPUT|SELECT/.test(e.target.tagName)&&!/^Key|Shift/.test(e.code))return;if(/INPUT|SELECT/.test(e.target.tagName))return;keys[e.code]=1});
+addEventListener('keyup',e=>keys[e.code]=0);
+let drag=false,lx=0,ly=0;const cv=renderer.domElement;
+cv.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;cv.setPointerCapture(e.pointerId)});
+cv.addEventListener('pointerup',()=>drag=false);
+cv.addEventListener('pointermove',e=>{if(!drag)return;yaw-=(e.clientX-lx)*.004;pitch=clamp(pitch-(e.clientY-ly)*.004,-1.5,1.5);lx=e.clientX;ly=e.clientY});
+document.getElementById('run').onclick=()=>{T=0;running=true};
+function rs(){const w=wrap.clientWidth,h=wrap.clientHeight;renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setSize(w,h);camera.aspect=w/h;camera.updateProjectionMatrix()}
+addEventListener('resize',rs);rs();
+
+const v=new THREE.Vector3(),r=new THREE.Vector3(),up=new THREE.Vector3(0,1,0);let last=performance.now();
+const showHeat=document.getElementById('heat');
+function frame(now){
+ const dt=Math.min(.05,(now-last)/1000);last=now;
+ if(running){T+=dt/7;if(T>=1){T=1;running=false}}
+ const jt=running?.004*Math.sin(now*.07):0;camera.rotation.set(pitch+jt,yaw+jt*.7,0);camera.getWorldDirection(v);r.crossVectors(v,up).normalize();
+ const s=(keys.ShiftLeft||keys.ShiftRight?360:120)*dt;
+ if(keys.KeyW)camera.position.addScaledVector(v,s);if(keys.KeyS)camera.position.addScaledVector(v,-s);
+ if(keys.KeyD)camera.position.addScaledVector(r,s);if(keys.KeyA)camera.position.addScaledVector(r,-s);
+ if(keys.KeyE)camera.position.y+=s;if(keys.KeyQ)camera.position.y-=s;
+ camera.position.y=Math.max(3,camera.position.y);
+ animateBuildings();
+ heatMesh.material.opacity=showHeat.checked?.85*clamp((T-.6)/.4,0,1):0;
+ renderer.render(scene,camera);requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script></body></html>
